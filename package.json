@@ -1,0 +1,8 @@
+{
+  "name": "navisworks-mcp",
+  "version": "1.0.0",
+  "description": "Navisworks MCP — Multi-file coordination, clash detection, viewpoints via APS",
+  "main": "src/index.js",
+  "author": "ScanBIM Labs LLC",
+  "license": "MIT"
+}
