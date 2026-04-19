@@ -1,0 +1,25 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.scanbimlabs/navisworks",
+  "description": "Navisworks clash detection, 4D simulation, quantity takeoff.",
+  "version": "1.1.0",
+  "repository": {
+    "url": "https://github.com/ScanBIM-Labs/navisworks-mcp",
+    "source": "github"
+  },
+  "homepage": "https://scanbimlabs.io/mcp",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.scanbimlabs.io/navisworks",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <ScanBIM API key>",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
