@@ -14,7 +14,7 @@ const __SLUG = "navisworks-mcp";
 const __VERSION = "1.0.0";
 async function __handleHealth(env) {
   const deps = {};
-  try { const r = await fetch('https://developer.api.autodesk.com/authentication/v2/token', { method: 'HEAD' }); deps.aps = r.ok ? 'ok' : 'degraded'; } catch { deps.aps = 'down'; }
+  try { const r = await fetch('https://developer.api.autodesk.com/authentication/v2/token', { method: 'HEAD' }); deps.aps = r.status < 500 ? 'ok' : 'degraded'; } catch { deps.aps = 'down'; }
   if (env && env.CACHE) { try { await env.CACHE.get('_hc'); deps.kv = 'ok'; } catch { deps.kv = 'degraded'; } }
   if (env && env.DB)    { try { await env.DB.prepare('SELECT 1').first(); deps.d1 = 'ok'; } catch { deps.d1 = 'degraded'; } }
   const worst = Object.values(deps).reduce((w, v) => v === 'down' ? 'down' : v === 'degraded' && w !== 'down' ? 'degraded' : w, 'ok');
