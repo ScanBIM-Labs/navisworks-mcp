@@ -13,4 +13,5 @@ database_name = "scanbim-mcp"
 database_id = "3c6dde6f-e729-4274-a5c1-dcbfa83f8c56"
 
 [vars]
+CREDITS_API = "https://uptime.scanbimlabs.io/api/credits/check-and-debit"
 VERSION = "1.0.0"

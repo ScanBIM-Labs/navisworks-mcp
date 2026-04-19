@@ -25,6 +25,64 @@ function __applySec(resp) {
   for (const [k, v] of Object.entries(__SEC_HEADERS)) h.set(k, v);
   return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
 }
+
+// --- credits middleware ---
+function __extractUserKey(req) {
+  const auth = req.headers.get('authorization') || '';
+  const m = auth.match(/^Bearer\s+(sk_scanbim_[A-Za-z0-9_-]+)/i);
+  if (m) return m[1];
+  const headerKey = req.headers.get('x-scanbim-api-key');
+  if (headerKey) return headerKey.trim();
+  return null;
+}
+function __toolCost(toolName) {
+  if (!toolName) return 1;
+  if (/render|video|walkthrough|export_video|render_image|render_video/i.test(toolName)) return 50;
+  if (/design_automation|da_run|import_rvt|tm_import_rvt|nwd_upload|upload_model/i.test(toolName)) return 20;
+  if (/ai_|explain|draft|qa_|clash_explain|ai-?authored/i.test(toolName)) return 5;
+  return 1;
+}
+async function __creditCheck(req, env, body) {
+  // Dormant until billing is fully configured (INTERNAL_API_TOKEN + CREDITS_API).
+  // This avoids breaking existing MCP clients before a billing cutover.
+  if (!env.INTERNAL_API_TOKEN || !env.CREDITS_API) return { ok: true };
+  if (body?.method !== 'tools/call') return { ok: true };
+  const toolName = body?.params?.name;
+  if (!toolName) return { ok: true };
+  const user_key = __extractUserKey(req);
+  if (!user_key) {
+    return { ok: false, response: Response.json({
+      jsonrpc: '2.0', id: body.id ?? null,
+      error: { code: -32001, message: 'Authentication required',
+        data: { error: 'missing_api_key',
+          hint: 'Include header: Authorization: Bearer sk_scanbim_<key>',
+          signup_url: 'https://scanbimlabs.io/credits' } }
+    }, { status: 401 }) };
+  }
+  const cost = __toolCost(toolName);
+  let r;
+  try {
+    r = await fetch(env.CREDITS_API, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-internal-token': env.INTERNAL_API_TOKEN },
+      body: JSON.stringify({ user_key, amount: cost, tool_name: toolName })
+    });
+  } catch (e) {
+    console.log('CREDITS: fetch failed', String(e));
+    return { ok: true }; // fail open on network error
+  }
+  if (r.status === 402) {
+    const info = await r.json().catch(() => ({}));
+    return { ok: false, response: Response.json({
+      jsonrpc: '2.0', id: body.id ?? null,
+      error: { code: -32002, message: 'Insufficient credits', data: info }
+    }, { status: 402 }) };
+  }
+  if (!r.ok) { console.log('CREDITS: check-and-debit returned', r.status); return { ok: true }; }
+  return { ok: true };
+}
+// --- end credits middleware ---
+
 // === end patch header ===
 
 // Navisworks MCP Worker v1.1.0 — Real APS-Backed Coordination Tools
@@ -685,6 +743,15 @@ export default {
     if (url.pathname === '/health') return __applySec(await __handleHealth(env));
     if (url.pathname === '/favicon.svg' || url.pathname === '/favicon.ico') {
       return __applySec(new Response(__FAVICON_SVG, { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=31536000, immutable' } }));
+    }
+    if (url.pathname === '/mcp' && req.method === 'POST') {
+      const cloned = req.clone();
+      let body;
+      try { body = await cloned.json(); } catch {}
+      if (body) {
+        const check = await __creditCheck(req, env, body);
+        if (!check.ok) return __applySec(check.response);
+      }
     }
     const resp = await __origHandler.fetch(req, env, ctx);
     return __applySec(resp);
