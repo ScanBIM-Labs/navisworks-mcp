@@ -147,62 +147,187 @@ async function getManifest(token, urn) {
 const TOOLS = [
   {
     name: 'nwd_upload',
-    description: 'Upload NWD/NWC file to APS and translate for coordination viewing',
+    description: [
+      'Upload a Navisworks file (.nwd/.nwf/.nwc) to Autodesk Platform Services (APS) Object Storage and start an SVF2 translation job so the model becomes queryable by the other nwd_* tools.',
+      '',
+      'When to use: at the start of a coordination workflow — e.g. the GC hands off a federated NWD combining MEP + structural + architectural models and the agent needs to stage it for clash review before issuing an RFI, or when a subcontractor publishes a new NWC model revision that must be ingested for weekly BIM coordination. Always the first call in a session for any new model.',
+      '',
+      'When NOT to use: do not call for already-translated models (re-use the returned model_id/URN); do not use for raw Revit .rvt, IFC, or DWG — those go through a different MCP.',
+      '',
+      'APS scopes required: data:read data:write data:create bucket:read bucket:create viewables:read. The worker acquires a 2-legged client-credentials token; the caller does not supply one.',
+      '',
+      'Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation job submission ~60 req/min. NWD bundles can be large (hundreds of MB); the upload PUT and translation can take minutes — translation is asynchronous, poll via nwd_export_report (manifest) with exponential backoff (e.g. 5s, 10s, 30s, 60s) before calling clash/properties tools.',
+      '',
+      'Errors the agent should handle: 401 invalid/expired APS token (surface as auth failure — do not retry with same creds); 403 missing scope (report scope gap, do not retry); 404 source file_url unreachable (ask user for a fresh public URL); 409 bucket already exists (handled internally, safe to ignore); 413/422 unsupported Navisworks version — APS Model Derivative supports NWD/NWC from Navisworks 2015 and later (state the unsupported version to the user); 429 rate limited (exponential backoff, retry); 5xx APS upstream (retry once, then surface).',
+      '',
+      'Side effects: creates a fresh transient OSS bucket (scanbim-nwd-<timestamp>, 24h TTL) and uploads the file as an object, then POSTs a Model Derivative translation job. NOT idempotent — each call creates a new bucket/URN even for the same file_url. Logs usage to the D1 usage_log table.'
+    ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        file_url: { type: 'string', description: 'Public URL to download the NWD/NWC file from' },
-        file_name: { type: 'string', description: 'Name for the file (e.g. "Coordination.nwd")' },
-        project_id: { type: 'string', description: 'Optional project label' }
+        file_url: {
+          type: 'string',
+          format: 'uri',
+          description: 'Publicly reachable HTTPS URL from which the worker will GET the Navisworks file bytes. Must return the raw binary (not an HTML landing page). Pre-signed S3 URLs, ACC/BIM360 signed-resource URLs, and Cloudflare R2 public URLs all work. Max practical size ~4 GB (Cloudflare Workers fetch body limit applies).',
+          examples: [
+            'https://example-bucket.s3.amazonaws.com/projects/tower-a/Coordination_2026-04-18.nwd?X-Amz-Signature=...',
+            'https://files.scanbimlabs.io/levelA_mep_structural_federated.nwd'
+          ]
+        },
+        file_name: {
+          type: 'string',
+          description: 'Logical filename for the OSS object. Must end in .nwd, .nwf, or .nwc (case-insensitive) so APS picks the correct translator. Avoid spaces and non-ASCII — the worker sanitizes to [A-Za-z0-9._-]. Follow ScanBIM convention: <project>_<discipline>_<rev>.nwd (e.g. TowerA_MEPStruct_R07.nwd).',
+          pattern: '.+\\.(nwd|nwf|nwc)$',
+          examples: ['TowerA_MEPStruct_R07.nwd', 'LevelB3_Coordination.nwc', 'Federated_Model.nwf']
+        },
+        project_id: {
+          type: 'string',
+          description: 'Optional free-form project label stored alongside the upload record for caller-side correlation. Not sent to APS. Typical values: ACC project GUID, internal job number, or short slug.',
+          examples: ['ACC-PROJ-8b2f', 'JOB-2026-0418-TowerA']
+        }
       },
       required: ['file_url', 'file_name']
     }
   },
   {
     name: 'nwd_get_clashes',
-    description: 'Detect clashes between object groups in a translated NWD model using bounding box overlap + D1 VDC rules',
+    description: [
+      'Detect geometric/logical clashes between two element sets in an already-translated Navisworks model. Uses APS Model Derivative property extraction + same-level proximity heuristics, optionally augmented by VDC rules stored in D1 (table vdc_rules).',
+      '',
+      'When to use: when coordinating federated MEP + structural + architectural models for clash review before issuing an RFI; e.g. "find duct vs. beam clashes on Level 3 before the Wed coordination meeting" or "sanity-check the latest MEP revision against structure before releasing for fabrication." Pair with nwd_export_report to produce a deliverable.',
+      '',
+      'When NOT to use: do not call on a model whose translation is still "inprogress" — call nwd_export_report first and confirm translation_status == "success"; not a substitute for Navisworks Manage Clash Detective for final sign-off (this is a coordination-stage screen, not a regulatory clash report).',
+      '',
+      'APS scopes required: viewables:read data:read (read-only — does not create anything in APS).',
+      '',
+      'Rate limits: APS default ~50 req/min per endpoint; Model Derivative metadata/properties endpoints are the bottleneck. Properties response may return 202 "isProcessing" on first call — the worker retries once after 3s. For very large models (>50k elements) the worker caps analysis at 50x50 element cross-compare and 100 reported clashes; re-run with tighter category_a/category_b filters for exhaustive coverage.',
+      '',
+      'Errors: 401 APS token expired (transient, retry); 403 missing viewables:read/data:read scope (report, do not retry); 404 URN not found or not translated (prompt user to re-run nwd_upload); 409 not applicable; 422 model translated but property index unavailable — typically means source NW version unsupported or translation partially failed (supported: Navisworks 2015+); 429 rate limit (backoff); 5xx APS upstream (retry once). If properties.data.collection is empty the tool returns clash_count: 0 with a note rather than erroring — the agent should treat that as "model not ready" and retry later.',
+      '',
+      'Side effects: none in APS. Reads vdc_rules from D1 when both categories are supplied. Logs usage to D1 usage_log. Idempotent — same inputs on a stable model yield the same clash list.'
+    ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        model_id: { type: 'string', description: 'Base64-encoded URN of translated model' },
-        clash_type: { type: 'string', enum: ['hard', 'soft', 'all'], description: 'Type of clashes to detect' },
-        category_a: { type: 'string', description: 'Optional first category filter (e.g. "Mechanical")' },
-        category_b: { type: 'string', description: 'Optional second category filter (e.g. "Structural")' }
+        model_id: {
+          type: 'string',
+          description: 'Base64url-encoded URN of the translated Navisworks model, exactly as returned by nwd_upload.model_id (or the urn field). Do NOT re-encode. Starts with "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6" for OSS-derived URNs.',
+          examples: ['dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1ud2QtMTcxMjM0NTY3OC9Ub3dlckFfTUVQU3RydWN0X1IwNy5ud2Q']
+        },
+        clash_type: {
+          type: 'string',
+          enum: ['hard', 'soft', 'all'],
+          description: 'Clash severity class. "hard" = solid-solid interference (e.g. duct through beam) — returns severity:critical. "soft" = clearance/tolerance violations (e.g. MEP within 50mm of structure) — returns severity:warning. "all" = both. Defaults to "all" when omitted.',
+          examples: ['hard', 'all']
+        },
+        category_a: {
+          type: 'string',
+          description: 'First element-set filter, case-insensitive substring match against each element\'s Revit/Navisworks Category. Common values: "Mechanical", "Ducts", "Pipes", "Plumbing", "Electrical", "Structural Framing", "Structural Columns", "Walls", "Floors", "Ceilings". Omit (with category_b) to auto-split MEP vs. structural.',
+          examples: ['Mechanical', 'Ducts', 'Structural Framing']
+        },
+        category_b: {
+          type: 'string',
+          description: 'Second element-set filter, same semantics as category_a. Must be supplied together with category_a to take effect — supplying only one is ignored in favor of auto-split. Provide both to also look up matching VDC rules from D1.',
+          examples: ['Structural', 'Structural Columns', 'Walls']
+        }
       },
       required: ['model_id']
     }
   },
   {
     name: 'nwd_export_report',
-    description: 'Generate a coordination report with clash summary, element counts, and model stats',
+    description: [
+      'Build a coordination report for a translated Navisworks model: translation status/progress, derivative outputs, available views (2D sheets / 3D viewables), total element count, and a per-category element breakdown. Doubles as the canonical way to poll translation status after nwd_upload.',
+      '',
+      'When to use: after nwd_upload to check whether translation has completed before calling clash/object tools; at the end of a coordination session to generate a status snapshot for the weekly BIM report; when auditing a model revision to confirm expected element counts per discipline.',
+      '',
+      'When NOT to use: do not use for a per-element property dump — use nwd_list_objects; do not use for clash results — use nwd_get_clashes.',
+      '',
+      'APS scopes required: viewables:read data:read bucket:read (read-only).',
+      '',
+      'Rate limits: APS default ~50 req/min per endpoint; this tool issues up to 4 sequential APS calls (manifest, metadata, properties — two with retry). When polling for translation completion, backoff: 5s, 10s, 30s, 60s, 120s — Model Derivative NWD translation typically completes in 1-10 min but large federated models can take 20+ min.',
+      '',
+      'Errors: 401 APS token expired (retry); 403 missing scope (report); 404 URN not found (model was never uploaded or bucket TTL expired); 409 N/A; 422 translation failed permanently — inspect report.translation_status == "failed" and report.derivatives[].status; 429 rate limit (backoff); 5xx APS upstream (retry once). Property extraction may legitimately 202 "isProcessing" — the tool handles retry and then silently swallows to still return manifest/metadata (element_count will be 0 until properties index is built).',
+      '',
+      'Side effects: none. Pure read. Idempotent — report reflects current APS state. Logs usage to D1 usage_log.'
+    ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        model_id: { type: 'string', description: 'Base64-encoded URN' },
-        format: { type: 'string', enum: ['json', 'summary'], description: 'Report format' }
+        model_id: {
+          type: 'string',
+          description: 'Base64url-encoded URN of the translated Navisworks model as returned by nwd_upload. Same value used by the other nwd_* tools.',
+          examples: ['dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1ud2QtMTcxMjM0NTY3OC9Ub3dlckFfTUVQU3RydWN0X1IwNy5ud2Q']
+        },
+        format: {
+          type: 'string',
+          enum: ['json', 'summary'],
+          description: 'Output shape. "json" (default) returns the full structured report object including derivatives[], views[], category_breakdown. "summary" still returns the same keys — the parameter is preserved for forward-compatibility and currently echoes back in the response for caller templating.',
+          examples: ['json', 'summary']
+        }
       },
       required: ['model_id']
     }
   },
   {
     name: 'nwd_get_viewpoints',
-    description: 'Retrieve saved viewpoints and camera positions from the model metadata',
+    description: [
+      'List saved viewpoints / camera positions and top-level view containers for a translated Navisworks model. Pulls the metadata view list and enriches each 3D view with its first two levels of the object tree (viewpoint folders typically live there in NWD files).',
+      '',
+      'When to use: when preparing a coordination meeting and you need a quick index of every saved viewpoint (e.g. "Level 3 Mech Room", "Clash - duct vs beam gridline C-4") to drive screenshots or BCF-style issues; when an agent needs to deep-link a 2D sheet or 3D camera into the APS Viewer.',
+      '',
+      'When NOT to use: does not return camera matrices (position/target/up vectors) — APS Model Derivative does not expose those from the NWD viewpoint XML; for full camera data the source NWD must be opened in Navisworks Manage.',
+      '',
+      'APS scopes required: viewables:read data:read.',
+      '',
+      'Rate limits: APS default ~50 req/min; this tool fans out one object-tree call per 3D view (capped implicitly by metadata view count, usually <5). For federated models with many sheets this can approach the per-minute quota — cache the result.',
+      '',
+      'Errors: 401 token (retry); 403 scope (report); 404 URN not found / translation incomplete; 409 N/A; 422 model returned empty metadata (returns viewpoint_count:0 rather than throwing — agent should verify translation via nwd_export_report); 429 rate limit (backoff); 5xx APS upstream (retry once). Per-view object-tree failures are swallowed so the overall call still returns the metadata-level view list.',
+      '',
+      'Side effects: none. Pure read. Idempotent. Logs usage to D1 usage_log. Results are capped at 100 viewpoint entries.'
+    ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        model_id: { type: 'string', description: 'Base64-encoded URN' }
+        model_id: {
+          type: 'string',
+          description: 'Base64url-encoded URN of the translated Navisworks model as returned by nwd_upload.',
+          examples: ['dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1ud2QtMTcxMjM0NTY3OC9Ub3dlckFfTUVQU3RydWN0X1IwNy5ud2Q']
+        }
       },
       required: ['model_id']
     }
   },
   {
     name: 'nwd_list_objects',
-    description: 'List model objects and their properties, optionally filtered by keyword',
+    description: [
+      'List elements (objects) in the translated Navisworks model with their objectid, name, externalId, and full property bag, optionally filtered by a case-insensitive keyword matched against name and Category.',
+      '',
+      'When to use: when answering "how many VAV boxes are on Level 3?", "list every steel column with mark C-*", or any per-element question; when dumping a quick takeoff of a discipline before handing off to an estimator; when an agent needs externalIds to cross-reference with a Revit or ACC issue.',
+      '',
+      'When NOT to use: not for clash detection (use nwd_get_clashes); not for camera/viewpoint data (use nwd_get_viewpoints); not for full-model exports — results are capped at 100 objects per call, so use the filter argument to narrow.',
+      '',
+      'APS scopes required: viewables:read data:read.',
+      '',
+      'Rate limits: APS default ~50 req/min; two Model Derivative calls per invocation (metadata guid + properties). Properties endpoint may 202 "isProcessing" on first call after translation — the worker retries once after 3s. For very large models the properties payload can be tens of MB; expect higher latency.',
+      '',
+      'Errors: 401 token (retry); 403 scope (report); 404 URN not found; 409 N/A; 422 property index not yet built — returns object_count:0 (poll via nwd_export_report); 429 rate limit (backoff); 5xx APS upstream (retry once). If property collection is legitimately empty the tool returns success with object_count:0 and an empty objects array.',
+      '',
+      'Side effects: none. Pure read. Idempotent. Logs usage to D1 usage_log. Response includes a `note` field when the unfiltered collection exceeds the 100-object cap.'
+    ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        model_id: { type: 'string', description: 'Base64-encoded URN' },
-        filter: { type: 'string', description: 'Optional keyword to filter objects by name/category' }
+        model_id: {
+          type: 'string',
+          description: 'Base64url-encoded URN of the translated Navisworks model as returned by nwd_upload.',
+          examples: ['dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1ud2QtMTcxMjM0NTY3OC9Ub3dlckFfTUVQU3RydWN0X1IwNy5ud2Q']
+        },
+        filter: {
+          type: 'string',
+          description: 'Optional case-insensitive substring. Matches if present in the element\'s name OR its Category property. Use Revit category names ("Ducts", "Pipes", "Structural Columns", "Walls") or mark/type fragments ("VAV", "W12x", "L3-"). Omit to return the first 100 elements of the model in property-collection order.',
+          examples: ['VAV', 'Ducts', 'Structural Columns', 'L3-']
+        }
       },
       required: ['model_id']
     }
